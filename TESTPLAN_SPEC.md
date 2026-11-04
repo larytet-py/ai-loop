@@ -10,7 +10,7 @@ The test plan defines how a change is verified, and it is written before any cod
 
 Input: the normalized ticket, the approved option, the current code at the base ref, and an inventory of existing unit, e2e, and UI tests.
 
-Output: `test_plan.md` and its hash file. The human reviews and may add or remove cases before the freeze.
+Output: `ai-loop/test_plan.md` and `ai-loop/test_plan.sha256` in the primary worktree of the run. The `ai-loop/` folder is created at stage 0 and excluded from git, so the plan is never part of the ticket's diff. The human reviews and may add or remove cases before the freeze.
 
 ## 3. Sections by task type
 

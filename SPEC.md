@@ -1,6 +1,6 @@
 # ai-loop - specification
 
-Status: draft v0.3. This document specifies behavior only. No implementation exists yet.
+Status: draft v0.4. This document specifies behavior only. No implementation exists yet.
 Companion document: `TESTPLAN_SPEC.md` (the test plan format and how it is produced).
 
 ## 1. Purpose
@@ -68,8 +68,15 @@ ai-loop SHOP-178 --test-node node-0393 --repo ~/repo-a --repo ~/repo-b@origin/ma
 Rules:
 
 - The analyst, test planner, and reviewer all search every listed repository. Option files and test cases carry the repository they belong to.
-- A worktree is created only for a repository the approved option actually changes, and only after the stage 3 approval. It is created under `worktree_root`, named after the ticket, with the repository name as a prefix when more than one repository is changed (for example `~/<repo>-<task>`, or `~/<task>` when there is exactly one).
-- Each changed repository gets its own branch named after the ticket and its own diff against its own `base_ref`.
+- Every run starts by creating a git worktree (stage 0), before the ticket is read. A worktree is created for each repository that is not `:ro`. It is created under `worktree_root`, from that repository's `base_ref`, on a new branch named after the ticket. It is named after the ticket, with the repository name as a prefix when more than one repository is writable (for example `~/<repo>-<task>`, or `~/<task>` when there is exactly one).
+- The primary worktree is the one of the first non-`:ro` repository on the command line. Generated documents (the proposal and the test plan) are written into its `ai-loop/` folder, see 4.3.
+- A worktree that ends up with no diff is reported at stage 8 and left for the human to remove.
+- Each changed repository has its own diff against its own `base_ref`.
+- If a branch or worktree named after the ticket already exists and was not created by this run, the orchestrator does not reuse it and does not let any agent read it, because it may already hold earlier work on the same ticket. It asks the human to choose: use a suffixed name (default, `<task>-ailoop`), or explicitly point the run at the existing one.
+
+### 4.3 The `ai-loop/` folder
+
+Inside the primary worktree, `ai-loop/` holds the documents the run generates for that ticket: `proposal.md`, `test_plan.md`, and `test_plan.sha256`. The orchestrator adds `ai-loop/` to the worktree's `info/exclude`, so it never shows in `git status` or in any diff, and it can never be committed by accident. Agents may write there before approval. They may not write anywhere else in the worktree until the gates in section 8 are passed.
 - The deploy skill decides how changes in several repositories reach the test node. ai-loop only passes it the list of changed worktrees.
 
 ### 4.1 Test node
@@ -107,8 +114,8 @@ Every stage has an entry condition, an exit artifact, and a validator. The orche
 ### Stage 0 - Preflight
 
 - Validate `task` format and that the ticket exists.
-- Repositories: verify every `--repo` path is a git repository and that its `base_ref` resolves. Fetch remotes so the base is current. No worktree is created yet, because it is not known which repositories will change.
-- Worktrees: when a worktree already exists for the ticket in a repository, require a clean tree on the ticket branch. Missing worktrees are created at the start of stage 5 for the changed repositories only (see 4.2).
+- Repositories: verify every `--repo` path is a git repository and that its `base_ref` resolves. Fetch remotes so the base is current.
+- Worktrees (always the first thing that is created): create a worktree and ticket branch for every non-`:ro` repository, from its `base_ref`, as described in 4.2. Create the `ai-loop/` folder in the primary worktree and exclude it from git (4.3). If a worktree or branch named after the ticket already exists, apply the collision rule in 4.2 before going on.
 - Verify the test node is reachable over ssh and the UI URL responds.
 - Verify required tools are installed.
 - Create `status.md` if absent (section 10).
@@ -127,7 +134,7 @@ Every stage has an entry condition, an exit artifact, and a validator. The orche
 
 ### Stage 2 - Analysis and options
 
-- Role: analyst. Input: `ticket.md` and the code. Output: `proposal.md`.
+- Role: analyst. Input: `ticket.md` and the code. Output: `proposal.md`, written to `ai-loop/proposal.md` in the primary worktree.
 - Content: the problem restated, evidence with file and line references, root cause hypothesis with confidence, the detected `task_type`, and 2 to 4 options. Per option: approach, files touched, risk, backward compatibility impact, test impact, effort. One option is marked recommended with reasons.
 - The analyst cannot edit files (tool allowlist).
 - Validator: at least two options, every field present, every file reference exists.
@@ -145,14 +152,14 @@ Every stage has an entry condition, an exit artifact, and a validator. The orche
 
 - Role: test planner. A separate agent session that runs before the implementer starts and has no access to any diff. The plan format and content rules are in `TESTPLAN_SPEC.md`.
 - Input: `ticket.md`, the approved option, the existing code, and the existing unit, e2e, and UI test inventory.
-- Output: `test_plan.md`, frozen with a content hash before implementation. Neither the implementer nor the UI tester can modify it. A change requires rerunning this stage and is logged.
+- Output: `ai-loop/test_plan.md` in the primary worktree, frozen with a content hash (`ai-loop/test_plan.sha256`) before implementation. Neither the implementer nor the UI tester can modify it. A change requires rerunning this stage and is logged.
 - The human sees the test plan summary and confirms it before stage 5 starts. This is a second, lighter gate. The human may add cases or remove cases, and the edit is logged.
 - Validator: schema check, and every targeted case traces to a statement in the ticket or the approved option.
 
 ### Stage 5 - Implementation
 
 - Role: implementer. Input: `ticket.md`, `approval.json`, the approved option, and `test_plan.md` (so it knows which unit and e2e tests to add or adjust).
-- Before editing, creates the missing worktrees for the repositories the approved option changes, each from its `base_ref`. Edits only inside those worktrees. Follows each repository's own conventions file.
+- Edits only inside the worktrees created at stage 0, and only in the repositories the approved option changes. Follows each repository's own conventions file.
 - Records `implementation_notes.md`: what changed and why, and each deviation from the approved option with a reason. Any deviation forces a human confirmation before stage 6.
 - Does not commit or push.
 - Validator: the diff is non-empty, touches only paths consistent with the approved option or a noted deviation, and the repository's formatter and linter pass. For `backend` and `mixed` tasks, the diff must contain the test changes the plan lists as required, or a recorded reason for omitting each.
@@ -199,8 +206,8 @@ All roles use the model `claude-sonnet-5-5`.
 
 | Role | Can read | Can write | Notes |
 |---|---|---|---|
-| analyst | ticket, code | `proposal.md` only | No edit tools |
-| test planner | ticket, approved option, code, test inventory | `test_plan.md` only | Runs before any code is generated, never sees a diff |
+| analyst | ticket, code | `ai-loop/proposal.md` in the primary worktree, nothing else | Cannot edit code |
+| test planner | ticket, approved option, code, test inventory | `ai-loop/test_plan.md` in the primary worktree, nothing else | Runs before any code is generated, never sees a diff |
 | implementer | ticket, approval, plan, code | workdir | Cannot change the plan |
 | UI tester | frozen plan, node | evidence and `test_report.md` | Cannot edit the plan or the code |
 | reviewer | diff, ticket, approved option | `review.md` only | Fresh context, never sees implementer notes |
@@ -212,7 +219,8 @@ Each role is a separate agent session with its own context and tool allowlist. I
 The workflow must not depend on the model following instructions.
 
 - The orchestrator is a state machine in code. Stage order is fixed. A stage runs only if the previous exit artifact exists and its validator passed.
-- Approval gate: a pre-tool-use hook denies edit and write tools, and deploy commands, until `approval.json` exists with a signature produced by the orchestrator. The same hook denies implementation tools until the test plan is frozen and confirmed.
+- Path gate: before approval, the hook allows writes only to the `ai-loop/` folder of the primary worktree. Every other path in every worktree is denied.
+- Approval gate: the hook denies writes to code paths, and deploy commands, until `approval.json` exists with a signature produced by the orchestrator. The same hook keeps code paths denied until the test plan is frozen and confirmed.
 - Test node gate: deploy and test commands are denied if `test_node` is unset or the node lock is not held by this run.
 - Tool allowlists per role, as in section 7.
 - Artifacts are hashed. The test plan hash is rechecked before UI verification. A mismatch aborts the run.
@@ -246,9 +254,7 @@ runs/<task>/<timestamp>/
   preflight.json
   ticket.md
   attachments/            originals, OCR text, frames, timelines
-  proposal.md
   approval.json
-  test_plan.md            plus test_plan.sha256
   implementation_notes.md
   diff-<repo>.patch       one per changed repository, base_ref..HEAD
   deploy.log
@@ -259,6 +265,15 @@ runs/<task>/<timestamp>/
   events.jsonl
   state.json
 tasks/<task>/status.md
+```
+
+In the primary worktree (excluded from git, see 4.3):
+
+```
+<worktree>/ai-loop/
+  proposal.md
+  test_plan.md
+  test_plan.sha256
 ```
 
 ## 12. Failure handling
@@ -289,7 +304,9 @@ tasks/<task>/status.md
 2. With `approval.json` absent, any agent attempt to edit a file or deploy is denied and logged.
 3. With the test plan not yet frozen and confirmed, implementation tools are denied.
 4. The test plan hash recorded before implementation equals the hash at verification time.
-5. With two `--repo` folders and an approved option that changes only one, a worktree is created for that one only, named after the ticket and branched from its `base_ref`, and the other repository is untouched. A `:ro` repository is never written to.
+5. The first action of every run, after the task key is validated and before intake starts, is creating a worktree and ticket branch from `base_ref` for each non-`:ro` repository. `proposal.md` and `test_plan.md` appear in the primary worktree's `ai-loop/` folder and are absent from `git status` and from the diff. A `:ro` repository is never written to.
+5a. If a branch or worktree named after the ticket already exists and was not created by the run, the run stops and asks, uses a suffixed name by default, and no agent reads the existing one.
+5b. Before approval, an agent attempt to write to any path other than `ai-loop/` is denied and logged.
 6. A deliberately injected UI regression is shown in the report and the orchestrator waits for a human decision instead of passing or failing it.
 7. The evidence archive contains GIFs or screenshots, backend logs, and the report, and is attached to the ticket only after the human confirms at stage 8.
 8. An injected unused variable, a duplicated block, a comment mentioning a previous iteration, and a shim for an earlier commit of the same MR are each reported in stage 7.
