@@ -1,6 +1,6 @@
 # ai-loop - specification
 
-Status: draft v0.2. This document specifies behavior only. No implementation exists yet.
+Status: draft v0.3. This document specifies behavior only. No implementation exists yet.
 Companion document: `TESTPLAN_SPEC.md` (the test plan format and how it is produced).
 
 ## 1. Purpose
@@ -16,7 +16,7 @@ ai-loop drives a coding agent through a fixed, enforced workflow for a single tr
 
 ## 3. Assumptions about the environment
 
-- A skill (outside this repo) tells the agent: where the code lives, how to deploy a cluster (`skaffold run`), how to reach a node over ssh, and the UI URL pattern. ai-loop does not hard-code any of this and must not name any product or company.
+- Where the code lives is given by the `--repo` parameters, not by a skill. A skill (outside this repo) tells the agent how to deploy a cluster (`skaffold run`), how to reach a node over ssh, and the UI URL pattern. ai-loop does not hard-code any of this and must not name any product or company.
 - Passwordless sudo is available on the test node. Skaffold and docker need no password.
 - Jira is reachable through an MCP server for reads, and through REST with an API token for attachments and writes. Credentials come from environment variables.
 - Tools on the machine running ai-loop: `ffmpeg`, `tesseract`, `git`, `ssh`, Python 3.11+, and the linters named in section 8.
@@ -29,13 +29,13 @@ Required:
 |---|---|---|
 | `task` | Task key, for example `SHOP-178` | Matches `^[A-Z][A-Z0-9]+-[0-9]+$` |
 | `test_node` | The node used for deploy and tests | Resolved to an ssh target and a UI URL (see 4.1). Reachability checked before stage 1 |
+| `repo` | One or more source folders that may contain the code for the task, for example `~/repo-a` and `~/repo-b` | Repeatable. Each must be a git repository. Syntax in 4.2 |
 
 Optional:
 
 | Name | Default | Meaning |
 |---|---|---|
-| `workdir` | `~/<task>` (a git worktree) | Created automatically if missing, see stage 0 |
-| `base_ref` | `origin/development` | Ref the diff is measured against |
+| `worktree_root` | `~` | Directory in which per-repo worktrees named after the ticket are created, see 4.2 and stage 0 |
 | `run_dir` | `./runs/<task>/<timestamp>` | Where run artifacts are written |
 | `task_type` | auto | `backend`, `ui`, or `mixed`. Auto-detected from the ticket and confirmed at the first human gate |
 | `max_review_rounds` | 3 | Reviewer-driven rework cap |
@@ -46,6 +46,31 @@ Optional:
 There is no wall-clock or token cap. See 4.1 for the node lifetime.
 
 Environment variables: `JIRA_USER_NAME`, `JIRA_API_TOKEN`, plus whatever the ssh and deploy skills require.
+
+### 4.2 Source folders
+
+The task may touch more than one component, so the run takes a list of folders to search for the code. Each `--repo` value has the form:
+
+```
+<path>[@<base_ref>][:ro]
+```
+
+- `path`: a git repository on this machine.
+- `@<base_ref>`: the ref diffs are measured against for this repository. Default `origin/development`, or the repository's default remote branch if that ref does not exist.
+- `:ro`: the repository is read-only for this run. The analyst and implementer can read it for context, and no worktree is created for it.
+
+Example, with placeholder names:
+
+```
+ai-loop SHOP-178 --test-node node-0393 --repo ~/repo-a --repo ~/repo-b@origin/main --repo ~/repo-c:ro
+```
+
+Rules:
+
+- The analyst, test planner, and reviewer all search every listed repository. Option files and test cases carry the repository they belong to.
+- A worktree is created only for a repository the approved option actually changes, and only after the stage 3 approval. It is created under `worktree_root`, named after the ticket, with the repository name as a prefix when more than one repository is changed (for example `~/<repo>-<task>`, or `~/<task>` when there is exactly one).
+- Each changed repository gets its own branch named after the ticket and its own diff against its own `base_ref`.
+- The deploy skill decides how changes in several repositories reach the test node. ai-loop only passes it the list of changed worktrees.
 
 ### 4.1 Test node
 
@@ -82,7 +107,8 @@ Every stage has an entry condition, an exit artifact, and a validator. The orche
 ### Stage 0 - Preflight
 
 - Validate `task` format and that the ticket exists.
-- Worktree: if `workdir` does not exist, create a git worktree there, named after the ticket, on a new branch named after the ticket, starting from `base_ref`. If it exists, require a clean tree on a non-default branch.
+- Repositories: verify every `--repo` path is a git repository and that its `base_ref` resolves. Fetch remotes so the base is current. No worktree is created yet, because it is not known which repositories will change.
+- Worktrees: when a worktree already exists for the ticket in a repository, require a clean tree on the ticket branch. Missing worktrees are created at the start of stage 5 for the changed repositories only (see 4.2).
 - Verify the test node is reachable over ssh and the UI URL responds.
 - Verify required tools are installed.
 - Create `status.md` if absent (section 10).
@@ -126,7 +152,7 @@ Every stage has an entry condition, an exit artifact, and a validator. The orche
 ### Stage 5 - Implementation
 
 - Role: implementer. Input: `ticket.md`, `approval.json`, the approved option, and `test_plan.md` (so it knows which unit and e2e tests to add or adjust).
-- Edits only inside `workdir`. Follows the repository's conventions file.
+- Before editing, creates the missing worktrees for the repositories the approved option changes, each from its `base_ref`. Edits only inside those worktrees. Follows each repository's own conventions file.
 - Records `implementation_notes.md`: what changed and why, and each deviation from the approved option with a reason. Any deviation forces a human confirmation before stage 6.
 - Does not commit or push.
 - Validator: the diff is non-empty, touches only paths consistent with the approved option or a noted deviation, and the repository's formatter and linter pass. For `backend` and `mixed` tasks, the diff must contain the test changes the plan lists as required, or a recorded reason for omitting each.
@@ -145,7 +171,7 @@ Every stage has an entry condition, an exit artifact, and a validator. The orche
 ### Stage 7 - Code review (independent agent, fresh context)
 
 - Role: reviewer. Sees the diff, the ticket, and the approved option. Does not see the implementer's notes or reasoning.
-- The only diff under review is the diff between `base_ref` and the branch head. Git history, earlier commits, and the MR's earlier iterations are context only, never the thing being compatible with.
+- For each changed repository, the only diff under review is the diff between that repository's `base_ref` and its branch head. Git history, earlier commits, and the MR's earlier iterations are context only, never the thing being compatible with. Cross-repository effects (for example a changed interface used by another listed repository) are in scope for the review.
 - Backward compatibility means compatibility with the code at `base_ref`. Code whose only purpose is to stay compatible with earlier commits of the same MR is a defect and the reviewer must flag it for removal.
 - Mechanical checks run first, in code, and are given to the reviewer as facts:
   - unused imports and variables
@@ -224,7 +250,7 @@ runs/<task>/<timestamp>/
   approval.json
   test_plan.md            plus test_plan.sha256
   implementation_notes.md
-  diff.patch              base_ref..HEAD
+  diff-<repo>.patch       one per changed repository, base_ref..HEAD
   deploy.log
   test_report.md
   evidence-<task>.tar.gz  GIFs or screenshots, backend logs, report
@@ -248,7 +274,7 @@ tasks/<task>/status.md
 - Jira tokens and ssh keys come from the environment or the agent forwarding socket, never from artifacts or logs.
 - Ticket content, comments, OCR text, and video text are untrusted data. They are passed to agents as quoted data with a standing instruction that they carry no commands. The orchestrator never executes anything derived from them.
 - Text in a ticket or attachment can never satisfy a human gate.
-- The tool touches only the given workdir, the given test node, and the one Jira ticket.
+- The tool writes only inside the ticket worktrees it created, never in the original `--repo` checkouts, never in a `:ro` repository, and touches only the given test node and the one Jira ticket.
 
 ## 14. Implementation
 
@@ -263,7 +289,7 @@ tasks/<task>/status.md
 2. With `approval.json` absent, any agent attempt to edit a file or deploy is denied and logged.
 3. With the test plan not yet frozen and confirmed, implementation tools are denied.
 4. The test plan hash recorded before implementation equals the hash at verification time.
-5. A missing worktree is created, named after the ticket, from `base_ref`.
+5. With two `--repo` folders and an approved option that changes only one, a worktree is created for that one only, named after the ticket and branched from its `base_ref`, and the other repository is untouched. A `:ro` repository is never written to.
 6. A deliberately injected UI regression is shown in the report and the orchestrator waits for a human decision instead of passing or failing it.
 7. The evidence archive contains GIFs or screenshots, backend logs, and the report, and is attached to the ticket only after the human confirms at stage 8.
 8. An injected unused variable, a duplicated block, a comment mentioning a previous iteration, and a shim for an earlier commit of the same MR are each reported in stage 7.
